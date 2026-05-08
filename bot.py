@@ -461,9 +461,15 @@ async def on_message(message):
 
                     total = sum(numbers)
 
+                    formula = " + ".join(f"{n:,}" for n in numbers)
+
                     await message.channel.send(
-                        f"合計ダメージ: {total:,}ぷな～"
+                        f"{formula}\n"
+                        f"= {total:,}ぷな～"
                     )
+
+                else:
+                    print("⚠ 読み取り失敗")
 
 # =====================
 # 起動
