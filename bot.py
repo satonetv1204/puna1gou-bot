@@ -94,10 +94,16 @@ EXPECTED_ROWS = 5
 
 OCR_CONFIG = "--psm 6 -c tessedit_char_whitelist=0123456789"
 
+# 基本パス：これで大半は5行そろう
+BASE_MODES = ["otsu", "adaptive", "150", "190"]
 
-def preprocess(img: Image.Image, variant: int) -> Image.Image:
+# 5行そろわなかったときだけ追加で試す閾値
+RESCUE_MODES = ["110", "130", "170", "210", "blur120"]
+
+
+def preprocess(img: Image.Image, mode: str) -> Image.Image:
     """左列（与えたダメージ）の数値領域を切り出して2値化する。
-    variantごとに閾値処理を変え、多数決で誤読を潰す。"""
+    行ごとに数字の濃さが違うことがあるので、modeで閾値処理を変える。"""
     w, h = img.size
 
     # 左列の数値部分だけを切り出す
@@ -108,16 +114,24 @@ def preprocess(img: Image.Image, variant: int) -> Image.Image:
 
     g = np.array(img.convert("L"))
 
-    if variant == 0:
+    if mode == "otsu":
         # Otsuの自動閾値
         _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    elif variant == 1:
-        # やや高めの固定閾値
-        _, b = cv2.threshold(g, 150, 255, cv2.THRESH_BINARY)
-    else:
+    elif mode == "adaptive":
+        # 局所適応閾値（行ごとの明るさムラに強い）
+        b = cv2.adaptiveThreshold(
+            g, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            51, 15,
+        )
+    elif mode == "blur120":
         # ノイズ除去 + 低めの固定閾値
         g = cv2.medianBlur(g, 3)
         _, b = cv2.threshold(g, 120, 255, cv2.THRESH_BINARY)
+    else:
+        # 固定閾値（"150" などの数値文字列）
+        _, b = cv2.threshold(g, int(mode), 255, cv2.THRESH_BINARY)
 
     return Image.fromarray(b)
 
@@ -186,17 +200,31 @@ def merge_rows(all_rows, row_tol=100):
 
 
 def analyze_image(img: Image.Image):
-    """3パスOCR + 多数決。同期関数（スレッドで実行する）。"""
+    """基本4パスでOCRし、5行そろわなければ閾値を変えて追加スキャン。
+    行ごとに多数決で値を決める。同期関数（スレッドで実行する）。"""
     all_rows = []
 
-    for v in range(3):
-        p = preprocess(img.copy(), v)
+    for mode in BASE_MODES:
+        p = preprocess(img.copy(), mode)
         rows = ocr_rows(p)
-        print(f"==== OCR variant {v} ====")
+        print(f"==== OCR {mode} ====")
         print(rows)
         all_rows += rows
 
     merged = merge_rows(all_rows)
+
+    # 5行に満たなければレスキューパス（そろった時点で打ち切り）
+    for mode in RESCUE_MODES:
+        if len(merged) >= EXPECTED_ROWS:
+            break
+
+        p = preprocess(img.copy(), mode)
+        rows = ocr_rows(p)
+        print(f"==== OCR rescue {mode} ====")
+        print(rows)
+        all_rows += rows
+
+        merged = merge_rows(all_rows)
 
     print("最終:", [(m["value"], round(m["agree"], 2)) for m in merged])
 
