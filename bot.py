@@ -4,7 +4,6 @@ import uuid
 import asyncio
 import discord
 import pytesseract
-import requests
 import re
 import cv2
 import numpy as np
@@ -13,6 +12,7 @@ from PIL import Image
 from io import BytesIO
 from flask import Flask
 from threading import Thread
+from collections import Counter
 from discord import app_commands
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -23,16 +23,17 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
     return "Bot is alive!"
 
 
 def run_web():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
 
-Thread(target=run_web).start()
+Thread(target=run_web, daemon=True).start()
 
 # =====================
 # TOKEN
@@ -71,110 +72,142 @@ JST = ZoneInfo("Asia/Tokyo")
 
 SCHEDULE_FILE = "schedules.json"
 
-# ファイルが無ければ作成
 if not os.path.exists(SCHEDULE_FILE):
     with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
         json.dump([], f)
 
 # =====================
-# 数字抽出
+# OCR設定
 # =====================
 
+# 8桁対応：5〜8桁まで許可（上限 99,999,999）
+MIN_DIGITS = 5
+MAX_DIGITS = 9
+MIN_VALUE = 10_000
+MAX_VALUE = 99_999_999
 
-def parse_numbers(text):
-    raw = re.findall(r"\d+", text)
+# 単語単位の信頼度がこれ未満のものは捨てる（ゴミ検出対策）
+MIN_CONF = 40
 
-    numbers = []
+# 何行分の数値を期待するか
+EXPECTED_ROWS = 5
 
-    for n in raw:
-        if 5 <= len(n) <= 8:
-            val = int(n)
-
-            if 10000 <= val <= 10000000:
-                numbers.append(val)
-
-    numbers = list(set(numbers))
-    numbers = sorted(numbers, reverse=True)
-
-    return numbers
-
-# =====================
-# 通常OCR
-# =====================
+OCR_CONFIG = "--psm 6 -c tessedit_char_whitelist=0123456789"
 
 
-def extract_main(img):
+def preprocess(img: Image.Image, variant: int) -> Image.Image:
+    """左列（与えたダメージ）の数値領域を切り出して2値化する。
+    variantごとに閾値処理を変え、多数決で誤読を潰す。"""
     w, h = img.size
 
-    img = img.crop((0, 0, w // 2, h))
+    # 左列の数値部分だけを切り出す
+    img = img.crop((int(w * 0.25), 0, int(w * 0.52), h))
 
-    img = img.crop((
-        int(w * 0.35),
-        0,
-        int(w * 0.95),
-        h
-    ))
+    # 高品質リサンプリングで4倍に拡大（5/9の潰れ対策）
+    img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
 
-    img = img.resize((img.width * 3, img.height * 3))
-    img = img.convert("L")
-    img = img.point(lambda x: 0 if x < 130 else 255)
+    g = np.array(img.convert("L"))
 
-    text = pytesseract.image_to_string(
+    if variant == 0:
+        # Otsuの自動閾値
+        _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    elif variant == 1:
+        # やや高めの固定閾値
+        _, b = cv2.threshold(g, 150, 255, cv2.THRESH_BINARY)
+    else:
+        # ノイズ除去 + 低めの固定閾値
+        g = cv2.medianBlur(g, 3)
+        _, b = cv2.threshold(g, 120, 255, cv2.THRESH_BINARY)
+
+    return Image.fromarray(b)
+
+
+def ocr_rows(img: Image.Image):
+    """image_to_dataで数値を行位置・信頼度つきで抽出する。"""
+    data = pytesseract.image_to_data(
         img,
-        config="--psm 6 -c tessedit_char_whitelist=0123456789"
+        config=OCR_CONFIG,
+        output_type=pytesseract.Output.DICT,
     )
 
-    print("==== 通常OCR ====")
-    print(text)
+    rows = []
 
-    return parse_numbers(text)
+    for i, txt in enumerate(data["text"]):
+        t = txt.strip()
+        try:
+            conf = int(float(data["conf"][i]))
+        except (ValueError, TypeError):
+            continue
 
-# =====================
-# 再抽出OCR
-# =====================
+        if not re.fullmatch(rf"\d{{{MIN_DIGITS},{MAX_DIGITS}}}", t):
+            continue
+
+        val = int(t)
+
+        if not (MIN_VALUE <= val <= MAX_VALUE):
+            continue
+
+        if conf < MIN_CONF:
+            continue
+
+        rows.append((data["top"][i], val, conf))
+
+    return rows
 
 
-def extract_retry(img):
-    w, h = img.size
+def merge_rows(all_rows, row_tol=100):
+    """複数パスの検出結果をy座標で行グルーピングし、
+    行ごとに多数決（同数なら信頼度最大）で値を決める。"""
+    groups = []  # [[y, [(val, conf), ...]], ...]
 
-    img = img.crop((0, 0, w // 2, h))
+    for y, val, conf in all_rows:
+        for g in groups:
+            if abs(g[0] - y) <= row_tol:
+                g[1].append((val, conf))
+                break
+        else:
+            groups.append([y, [(val, conf)]])
 
-    img = img.crop((
-        int(w * 0.2),
-        0,
-        int(w * 0.95),
-        h
-    ))
+    result = []
 
-    img = img.resize((img.width * 2, img.height * 2))
-    img = img.convert("L")
+    for y, cands in sorted(groups):
+        counts = Counter(v for v, c in cands)
+        best = max(
+            counts,
+            key=lambda v: (
+                counts[v],
+                max(c for vv, c in cands if vv == v),
+            ),
+        )
+        agree = counts[best] / len(cands)
+        result.append({"y": y, "value": best, "agree": agree, "cands": cands})
 
-    img_np = np.array(img)
+    return result
 
-    img_np = cv2.medianBlur(img_np, 3)
 
-    _, img_np = cv2.threshold(
-        img_np,
-        180,
-        255,
-        cv2.THRESH_BINARY
-    )
+def analyze_image(img: Image.Image):
+    """3パスOCR + 多数決。同期関数（スレッドで実行する）。"""
+    all_rows = []
 
-    img = Image.fromarray(img_np)
+    for v in range(3):
+        p = preprocess(img.copy(), v)
+        rows = ocr_rows(p)
+        print(f"==== OCR variant {v} ====")
+        print(rows)
+        all_rows += rows
 
-    text = pytesseract.image_to_string(
-        img,
-        config="--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789"
-    )
+    merged = merge_rows(all_rows)
 
-    print("==== 再抽出OCR ====")
-    print(text)
+    print("最終:", [(m["value"], round(m["agree"], 2)) for m in merged])
 
-    return parse_numbers(text)
+    return merged
 
 # =====================
 # 予約監視ループ
 # =====================
+
+# プロセス内での二重送信ガード
+sent_ids = set()
 
 
 async def schedule_loop():
@@ -199,6 +232,12 @@ async def schedule_loop():
                 ).replace(tzinfo=JST)
 
                 if now >= send_time:
+
+                    # 同じ予約を二度送らない
+                    if s["id"] in sent_ids:
+                        continue
+
+                    sent_ids.add(s["id"])
 
                     channel = client.get_channel(s["channel_id"])
 
@@ -225,13 +264,22 @@ async def schedule_loop():
 # 起動時
 # =====================
 
+# on_readyは再接続のたびに呼ばれるので、
+# タスク生成とコマンド同期は初回だけにする
+_started = False
+
 
 @client.event
 async def on_ready():
 
-    await tree.sync()
+    global _started
 
-    client.loop.create_task(schedule_loop())
+    if not _started:
+        _started = True
+
+        await tree.sync()
+
+        client.loop.create_task(schedule_loop())
 
     print(f"ログインした: {client.user}")
 
@@ -425,47 +473,54 @@ async def on_message(message):
                 (".png", ".jpg", ".jpeg")
             ):
 
-                response = requests.get(attachment.url)
+                # discord.py組み込みのreadを使う（requests不要）
+                data = await attachment.read()
 
-                img = Image.open(BytesIO(response.content))
+                img = Image.open(BytesIO(data))
 
-                # 通常
-                numbers_main = extract_main(img)
+                # OCRは重いのでスレッドに逃がす
+                # （イベントループを止めない＝Botの反応が遅くならない）
+                merged = await asyncio.to_thread(analyze_image, img)
 
-                print("通常:", numbers_main)
+                # 上位EXPECTED_ROWS行だけ使う（画面上の並び順のまま）
+                merged = merged[:EXPECTED_ROWS]
 
-                # 再抽出
-                numbers_retry = []
+                values = [m["value"] for m in merged]
 
-                if len(numbers_main) < 5:
+                if len(values) == EXPECTED_ROWS:
 
-                    print("⚠️ 再抽出発動")
+                    total = sum(values)
 
-                    numbers_retry = extract_retry(img)
+                    formula = " + ".join(f"{n:,}" for n in values)
 
-                    print("再抽出:", numbers_retry)
+                    # OCRパス間で結果が割れた行があれば注意書き
+                    shaky = [
+                        f"{m['value']:,}"
+                        for m in merged
+                        if m["agree"] < 1.0
+                    ]
 
-                # 統合
-                numbers = list(
-                    set(numbers_main + numbers_retry)
-                )
-
-                numbers = sorted(
-                    numbers,
-                    reverse=True
-                )[:5]
-
-                print("最終:", numbers)
-
-                if len(numbers) == 5:
-
-                    total = sum(numbers)
-
-                    formula = " + ".join(f"{n:,}" for n in numbers)
+                    warn = ""
+                    if shaky:
+                        warn = (
+                            "\n⚠ "
+                            + "、".join(shaky)
+                            + " は読み取りが揺れたので確認してほしいぷな…"
+                        )
 
                     await message.channel.send(
                         f"{formula}\n"
-                        f"= {total:,}ぷな～"
+                        f"= {total:,}ぷな～{warn}"
+                    )
+
+                elif values:
+
+                    formula = " + ".join(f"{n:,}" for n in values)
+
+                    await message.channel.send(
+                        f"{len(values)}行しか読めなかったぷな…\n"
+                        f"{formula}\n"
+                        f"= {sum(values):,}（不完全）"
                     )
 
                 else:
