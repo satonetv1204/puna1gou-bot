@@ -80,11 +80,11 @@ if not os.path.exists(SCHEDULE_FILE):
 # OCR設定
 # =====================
 
-# 8桁対応：5〜8桁まで許可（上限 99,999,999）
+# 8桁対応：5〜9桁まで許可（上限 999,999,999）
 MIN_DIGITS = 5
 MAX_DIGITS = 9
 MIN_VALUE = 10_000
-MAX_VALUE = 99_999_999
+MAX_VALUE = 999_999_999
 
 # 単語単位の信頼度がこれ未満のものは捨てる（ゴミ検出対策）
 MIN_CONF = 40
@@ -513,18 +513,10 @@ async def on_message(message):
                         f"= {total:,}ぷな～{warn}"
                     )
 
-                elif values:
-
-                    formula = " + ".join(f"{n:,}" for n in values)
-
-                    await message.channel.send(
-                        f"{len(values)}行しか読めなかったぷな…\n"
-                        f"{formula}\n"
-                        f"= {sum(values):,}（不完全）"
-                    )
-
                 else:
-                    print("⚠ 読み取り失敗")
+                    # 5行そろわない＝ダメージレポートではない可能性が
+                    # 高いので、何も送らずログだけ残す
+                    print(f"読み取り{len(values)}行のためスキップ")
 
 # =====================
 # 起動
